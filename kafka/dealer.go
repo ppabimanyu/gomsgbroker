@@ -3,13 +3,22 @@ package kafka
 import (
 	"context"
 	"crypto/tls"
-	"github.com/rs/zerolog"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl"
 	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/segmentio/kafka-go/sasl/scram"
-	"os"
-	"time"
+)
+
+const (
+	TraceIDHeaderKey = "Trace-Id"
+	TraceIDCtxKey    = "trace_id"
+	RequestIDCtxKey  = "request_id"
 )
 
 type Config struct {
@@ -31,9 +40,6 @@ type Config struct {
 
 	// TlsConfig is the TLS configuration to use for secure connections.
 	TlsConfig *tls.Config
-
-	// Logger is the logger to use for logging.
-	Logger *zerolog.Logger
 }
 
 type Dealer struct {
@@ -55,10 +61,6 @@ func NewDealer(config *Config) *Dealer {
 	}
 	if config.TlsConfig == nil {
 		config.TlsConfig = &tls.Config{}
-	}
-	if config.Logger == nil {
-		logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
-		config.Logger = &logger
 	}
 
 	var tlsConfig = config.TlsConfig
@@ -108,7 +110,8 @@ func NewDealer(config *Config) *Dealer {
 		}
 		tlsConfig = &tls.Config{}
 	} else {
-		panic("unsupported security protocol or SASL mechanism")
+		slog.Error("unsupported security protocol or SASL mechanism")
+		os.Exit(1)
 	}
 
 	return &Dealer{
@@ -133,8 +136,12 @@ func (d *Dealer) DefaultReader(topic string, groupID ...string) *kafka.Reader {
 			SASLMechanism: d.Mechanism,
 			TLS:           d.TlsConfig,
 		},
-		ErrorLogger: d.Config.Logger,
-		Logger:      d.Config.Logger,
+		ErrorLogger: kafka.LoggerFunc(func(s string, i ...any) {
+			slog.Error(s, i...)
+		}),
+		Logger: kafka.LoggerFunc(func(s string, i ...any) {
+			slog.Info(s, i...)
+		}),
 	}
 	if len(groupID) > 0 {
 		config.GroupID = groupID[0]
@@ -151,8 +158,12 @@ func (d *Dealer) DefaultWriter(topic string) *kafka.Writer {
 		BatchSize:    100,
 		BatchTimeout: time.Second,
 		Compression:  kafka.Lz4,
-		Logger:       d.Config.Logger,
-		ErrorLogger:  d.Config.Logger,
+		ErrorLogger: kafka.LoggerFunc(func(s string, i ...any) {
+			slog.Error(s, i...)
+		}),
+		Logger: kafka.LoggerFunc(func(s string, i ...any) {
+			slog.Info(s, i...)
+		}),
 		Transport: &kafka.Transport{
 			TLS:  d.TlsConfig,
 			SASL: d.Mechanism,
@@ -167,7 +178,7 @@ func (d *Dealer) DefaultConsumer(consumerFunc ConsumerFunc, topic string, groupI
 	reader := d.DefaultReader(topic, groupID...)
 	defer func() {
 		if err := reader.Close(); err != nil {
-			d.Config.Logger.Error().Err(err).Msg("Kafka: Failed to close reader")
+			slog.Error("Kafka: Failed to close reader", "error", err.Error())
 		}
 	}()
 
@@ -176,19 +187,33 @@ func (d *Dealer) DefaultConsumer(consumerFunc ConsumerFunc, topic string, groupI
 		case <-d.Context.Done():
 			return
 		default:
-			message, err := reader.FetchMessage(d.Context)
+			requestID := uuid.New().String()
+			ctx := context.WithValue(d.Context, RequestIDCtxKey, requestID)
+
+			message, err := reader.FetchMessage(ctx)
 			if err != nil {
-				d.Config.Logger.Error().Err(err).Msg("Kafka: Failed to fetch message")
+				slog.ErrorContext(ctx, "Kafka: Failed to fetch message", "topic", topic, "error", err.Error())
 				continue
 			}
-			d.Config.Logger.Info().Str("topic", message.Topic).Str("key", string(message.Key)).Str("value", string(message.Value)).Msg("Kafka: Received message")
-			if err := consumerFunc(d.Context, message); err != nil {
-				d.Config.Logger.Error().Err(err).Str("topic", message.Topic).Msg("Kafka: Failed to process message")
-			} else {
-				if err := reader.CommitMessages(d.Context, message); err != nil {
-					d.Config.Logger.Error().Err(err).Str("topic", message.Topic).Msg("Kafka: Failed to commit message")
+
+			traceID := requestID
+			for _, h := range message.Headers {
+				if strings.ToLower(string(h.Key)) == strings.ToLower(TraceIDHeaderKey) {
+					traceID = string(h.Value)
+					break
 				}
-				d.Config.Logger.Info().Str("topic", message.Topic).Str("key", string(message.Key)).Msg("Kafka: Committed message")
+			}
+			ctx = context.WithValue(ctx, TraceIDCtxKey, traceID)
+
+			slog.InfoContext(ctx, "Kafka: Received message", "topic", message.Topic, "key", string(message.Key), "value", string(message.Value))
+			if err := consumerFunc(ctx, message); err != nil {
+				slog.ErrorContext(ctx, "Kafka: Failed to process message", "topic", message.Topic, "key", string(message.Key), "value", string(message.Value), "error", err.Error())
+			} else {
+				if err := reader.CommitMessages(ctx, message); err != nil {
+					slog.ErrorContext(ctx, "Kafka: Failed to commit message", "topic", message.Topic, "key", string(message.Key), "value", string(message.Value), "error", err.Error())
+				} else {
+					slog.InfoContext(ctx, "Kafka: Committed message", "topic", message.Topic, "key", string(message.Key), "value", string(message.Value))
+				}
 			}
 		}
 	}

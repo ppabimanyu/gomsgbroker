@@ -3,10 +3,17 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"github.com/rabbitmq/amqp091-go"
-	"github.com/rs/zerolog"
-	"os"
+	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/rabbitmq/amqp091-go"
+)
+
+const (
+	TraceIDHeaderKey = "Trace-Id"
+	TraceIDCtxKey    = "trace_id"
+	RequestIDCtxKey  = "request_id"
 )
 
 type Config struct {
@@ -29,9 +36,6 @@ type Config struct {
 	// VHost is the RabbitMQ virtual host.
 	// Default is "/".
 	VHost string
-
-	// Logger is the logger to use for logging.
-	Logger *zerolog.Logger
 }
 
 type Dealer struct {
@@ -55,10 +59,6 @@ func NewDealer(config *Config) *Dealer {
 	if config.Password == "" {
 		config.Password = "guest"
 	}
-	if config.Logger == nil {
-		logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
-		config.Logger = &logger
-	}
 
 	return &Dealer{
 		config: config,
@@ -75,16 +75,13 @@ func NewDealerWithContext(ctx context.Context, config *Config) *Dealer {
 func (d *Dealer) CreateConnection() *amqp091.Channel {
 	conn, err := amqp091.Dial(fmt.Sprintf("amqp://%s:%s@%s:%d/%s", d.config.Username, d.config.Password, d.config.Host, d.config.Port, d.config.VHost))
 	if err != nil {
-		d.config.Logger.Error().Ctx(d.ctx).Err(err).Msg("RabbitMQ: Failed to connect to RabbitMQ")
+		slog.Error("RabbitMQ: Failed to connect to RabbitMQ", "error", err.Error())
 		return nil
 	}
 
 	channel, err := conn.Channel()
 	if err != nil {
-		d.config.Logger.Error().Err(err).Msg("RabbitMQ: Failed to open a channel")
-		return nil
-	}
-	if channel == nil {
+		slog.Error("RabbitMQ: Failed to open a channel", "error", err.Error())
 		return nil
 	}
 
@@ -114,23 +111,31 @@ func (d *Dealer) DefaultConsumer(consumerFunc ConsumerFunc, queue string, consum
 
 	consumer, err := conn.ConsumeWithContext(d.ctx, queue, consumerName[0], false, false, false, false, nil)
 	if err != nil {
-		d.config.Logger.Error().Err(err).Msg("RabbitMQ: Failed to register consumer")
+		slog.Error("RabbitMQ: Failed to register consumer", "error", err.Error())
 		return
 	}
 
 	for message := range consumer {
-		d.config.Logger.Info().Str("queue", queue).Str("body", string(message.Body)).Msg("RabbitMQ: Received message")
+		requestID := uuid.New().String()
+		traceID := requestID
+		if val, ok := message.Headers[TraceIDHeaderKey]; ok {
+			traceID = val.(string)
+		}
+		ctx := context.WithValue(d.ctx, RequestIDCtxKey, requestID)
+		ctx = context.WithValue(ctx, TraceIDCtxKey, traceID)
+
+		slog.InfoContext(ctx, "RabbitMQ: Received message", "queue", queue, "body", string(message.Body))
 		err := consumerFunc(d.ctx, message)
 		if err != nil {
-			d.config.Logger.Error().Err(err).Msg("RabbitMQ: Failed to process message")
+			slog.ErrorContext(ctx, "RabbitMQ: Failed to process message", "queue", queue, "body", string(message.Body), "error", err.Error())
 			if err := message.Nack(false, false); err != nil {
-				d.config.Logger.Error().Err(err).Msg("RabbitMQ: Failed to Nack message")
+				slog.ErrorContext(ctx, "RabbitMQ: Failed to Nack message", "queue", queue, "body", string(message.Body), "error", err.Error())
 			}
 		} else {
 			if err := message.Ack(false); err != nil {
-				d.config.Logger.Error().Err(err).Msg("RabbitMQ: Failed to Ack message")
+				slog.ErrorContext(ctx, "RabbitMQ: Failed to Ack message", "queue", queue, "body", string(message.Body), "error", err.Error())
 			} else {
-				d.config.Logger.Info().Str("queue", queue).Msg("RabbitMQ: Acknowledged message")
+				slog.InfoContext(ctx, "RabbitMQ: Acknowledged message", "queue", queue, "body", string(message.Body))
 			}
 		}
 	}
